@@ -1,6 +1,7 @@
 // The forge's HTTP server: git smart HTTP, REST v3, GraphQL v4 and MCP, over one in-memory store.
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { handleGit } from './githttp.ts';
+import { createFastServer } from './httpfast.ts';
 import { handleGraphql } from './graphql.ts';
 import { handleMcp } from './mcp.ts';
 import * as S from './store.ts';
@@ -35,6 +36,21 @@ function sendJson(res: ServerResponse, status: number, body: unknown, headers: R
   res.end(buf);
 }
 
+/** Bumped by every non-GET request on any surface; cached GET replies from an older epoch are dropped. */
+export let writeEpoch = 0;
+export function bumpEpoch() { writeEpoch++; }
+const getCache = new Map<string, { epoch: number; status: number; buf: Buffer; headers: Record<string, string> }>();
+
+function sendRaw(res: ServerResponse, status: number, buf: Buffer, headers: Record<string, string>) {
+  res.writeHead(status, {
+    'content-type': 'application/json; charset=utf-8',
+    'x-github-request-id': `F0RG:${(++reqCounter).toString(16).toUpperCase()}`,
+    'content-length': buf.length,
+    ...headers,
+  });
+  res.end(buf);
+}
+
 function readBody(req: IncomingMessage): Promise<Buffer> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
@@ -50,17 +66,31 @@ function parseJson(body: Buffer): any {
 }
 
 export function createApp(): Server {
-  const server = createServer(async (req, res) => {
+  // The lean net-based server is the default; FORGE_HTTP=node falls back to node:http.
+  if (process.env.FORGE_HTTP !== 'node') return createFastServer((req, res) => route(req as any, res as any, req.body));
+  const server = createServer(async (req, res) => route(req, res, await readBody(req)));
+  server.keepAliveTimeout = 65_000;
+  return server;
+}
+
+async function route(req: IncomingMessage, res: ServerResponse, body: Buffer): Promise<void> {
+  // Any request that can write (everything but GET and the read-only upload-pack POST) clears the read cache.
+  const mutating = req.method !== 'GET' && !(req.url ?? '').includes('/git-upload-pack');
+  if (mutating) writeEpoch++;
+  try { await routeInner(req, res, body); } finally { if (mutating) writeEpoch++; }
+}
+
+async function routeInner(req: IncomingMessage, res: ServerResponse, body: Buffer): Promise<void> {
     try {
-      const url = new URL(req.url ?? '/', 'http://x');
-      const path = url.pathname;
+      const rawUrl = req.url ?? '/';
+      const q = rawUrl.indexOf('?');
+      const path = q < 0 ? rawUrl : rawUrl.slice(0, q);
+      const url = { pathname: path, searchParams: new URLSearchParams(q < 0 ? '' : rawUrl.slice(q + 1)) };
       if (path === '/healthz') return sendJson(res, 200, { ok: true });
       const gitMatch = /^\/([^/]+)\/([^/]+?)(?:\.git)?(\/info\/refs|\/git-upload-pack|\/git-receive-pack)$/.exec(path);
       if (gitMatch) {
-        const body = await readBody(req);
         return await handleGit(req, res, decodeURIComponent(gitMatch[1]), decodeURIComponent(gitMatch[2]), gitMatch[3], url.searchParams, body);
       }
-      const body = await readBody(req);
       if (path === '/mcp' || path.startsWith('/mcp/')) return await handleMcp(req, res, body);
       if (path === '/api/graphql' || path === '/graphql') {
         if (!authOk(req)) return sendJson(res, 401, { message: 'Bad credentials', documentation_url: 'https://docs.github.com/graphql' });
@@ -69,7 +99,19 @@ export function createApp(): Server {
       if (path === '/api/v3' || path.startsWith('/api/v3/')) {
         if (!authOk(req)) return sendJson(res, 401, { message: 'Requires authentication', documentation_url: 'https://docs.github.com/rest' });
         const sub = path.slice(7) || '/';
+        if (req.method === 'GET') {
+          // Reads are served from a cache that every write clears (writeEpoch), so a GET never sees stale data.
+          const key = `${req.headers.host}|${rawUrl}`;
+          const hit = getCache.get(key);
+          if (hit && hit.epoch === writeEpoch) return sendRaw(res, hit.status, hit.buf, hit.headers);
+          const out = await rest(req, sub, url.searchParams, body);
+          const buf = Buffer.from(JSON.stringify(out.body));
+          if (out.status === 200) { if (getCache.size > 5000) getCache.clear(); getCache.set(key, { epoch: writeEpoch, status: out.status, buf, headers: out.headers ?? {} }); }
+          return sendRaw(res, out.status, buf, out.headers ?? {});
+        }
+        writeEpoch++;
         const out = await rest(req, sub, url.searchParams, body);
+        writeEpoch++;
         return sendJson(res, out.status, out.body, out.headers);
       }
       return sendJson(res, 404, { message: 'Not Found' });
@@ -78,9 +120,6 @@ export function createApp(): Server {
       process.stderr.write(`[forge] ${(e as Error).stack}\n`);
       return sendJson(res, 500, { message: 'Internal Server Error' });
     }
-  });
-  server.keepAliveTimeout = 65_000;
-  return server;
 }
 
 // ---------------------------------------------------------------- serializers (shared with GraphQL/MCP)

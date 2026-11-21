@@ -193,6 +193,17 @@ function selectObjects(wants: string[], haves: string[], clientShallow: Set<stri
 const packCache = new Map<string, Buffer[]>();
 
 function uploadPackV2(r: Repo, body: Buffer): Buffer[] {
+  // Every v2 command's answer depends only on the request bytes and the repository's ref state.
+  const cacheKey = `${r.id}@${r.version}:${body.length}:${createHash('sha1').update(body).digest('hex')}`;
+  const hit = packCache.get(cacheKey);
+  if (hit) return hit;
+  const out = uploadPackV2Uncached(r, body);
+  if (packCache.size > 500) packCache.clear();
+  packCache.set(cacheKey, out);
+  return out;
+}
+
+function uploadPackV2Uncached(r: Repo, body: Buffer): Buffer[] {
   const { pkts } = readPkts(body);
   let command = '';
   const args: string[] = [];
@@ -205,15 +216,7 @@ function uploadPackV2(r: Repo, body: Buffer): Buffer[] {
     else args.push(line);
   }
   if (command === 'ls-refs') return lsRefs(r, args);
-  if (command === 'fetch') {
-    const cacheKey = `${r.owner}/${r.name}@${r.version}:${createHash('sha1').update(body).digest('hex')}`;
-    const cached = packCache.get(cacheKey);
-    if (cached) return cached;
-    const out = fetchV2(r, args);
-    if (packCache.size > 200) packCache.clear();
-    packCache.set(cacheKey, out);
-    return out;
-  }
+  if (command === 'fetch') return fetchV2(r, args);
   throw new Error(`unknown command ${command}`);
 }
 
