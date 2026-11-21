@@ -457,7 +457,7 @@ function contentsRoutes(r: S.Repo, path: string, q: URLSearchParams, body: any, 
     const buf = Buffer.from(content.replace(/\s/g, ''), 'base64');
     const commit = S.commitFiles(r, branch, [{ path, content: buf }], message);
     const e = S.lookupPath(S.commitTree(commit), path)!;
-    return ok({ content: contentEntry(r, path, e.oid, e.mode), commit: commitShort(r, commit) }, existing ? 200 : 201);
+    return ok({ content: { ...contentEntry(r, path, e.oid, e.mode), encoding: 'base64', content: buf.toString('base64') }, commit: commitShort(r, commit) }, existing ? 200 : 201);
   }
   if (method === 'DELETE') {
     const message = str(body.message, 'message', true)!;
