@@ -18,6 +18,10 @@
 
 import { createApp } from './app.ts';
 
+// forge-mf: the store lives in memory, so a stray SIGTERM before the env says done still exits cleanly.
+process.on('SIGTERM', () => process.exit(0));
+process.on('unhandledRejection', (reason) => process.stderr.write(`[forge] unhandled rejection: ${String(reason)}\n`));
+
 const ENV_URL = (process.env.MAKEFUN_ENV_URL ?? '').replace(/\/+$/, '');
 if (ENV_URL === '') {
   process.stderr.write('[entry] MAKEFUN_ENV_URL is not set: there is no env to register with\n');
